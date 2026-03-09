@@ -73,7 +73,10 @@ class ResearchLoop:
 
     def run(self, strategy_path: str | None = None) -> LoopState:
         """Run the full autonomous loop."""
-        strategy = self.load_strategy(strategy_path)
+        if self.state.strategy and not strategy_path:
+            strategy = self.state.strategy
+        else:
+            strategy = self.load_strategy(strategy_path)
         self.state.started_at = datetime.now(timezone.utc)
         self.state.status = "running"
 
