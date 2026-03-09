@@ -1,4 +1,4 @@
-"""FastAPI server for running research loops via API."""
+"""FastAPI server for running research loops and campaigns via API."""
 
 from __future__ import annotations
 
@@ -10,18 +10,25 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from gridmind.core.agent import AgentConfig
-from gridmind.core.loop import LoopConfig, LoopState, ResearchLoop
+from gridmind.core.loop import LoopConfig, ResearchLoop
+from gridmind.core.orchestrator import (
+    CampaignConfig,
+    Orchestrator,
+    DOMAIN_SIGNAL_SPEED,
+    estimate_experiments,
+)
 from gridmind.core.strategy import StrategyLoader
 from gridmind.domains.registry import DomainRegistry
 
 app = FastAPI(
     title="GridMind",
     description="Autonomous research loops for any domain. Write strategy docs, run experiments while you sleep.",
-    version="0.1.0",
+    version="0.2.0",
 )
 
-# In-memory store of running/completed loops
+# In-memory store
 _loops: dict[str, dict] = {}
+_campaigns: dict[str, dict] = {}
 
 
 class RunRequest(BaseModel):
@@ -34,19 +41,25 @@ class RunRequest(BaseModel):
     results_dir: str = "results"
 
 
-class InitRequest(BaseModel):
-    domain: str
+class CampaignRequest(BaseModel):
+    name: str = "campaign"
+    strategies_dir: str = "strategies"
+    provider: str = "anthropic"
+    model: str | None = None
+    dry_run: bool = False
+    max_workers: int = 4
+    results_dir: str = "results"
 
 
-# --- Endpoints ---
-
+# --- Root ---
 
 @app.get("/")
 async def root():
     return {
         "name": "GridMind",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "Autonomous research loops for any domain",
+        "domains": len(DomainRegistry.list_domains()),
         "pattern": [
             "1. Human writes strategy doc (.md)",
             "2. Agent runs experiments autonomously",
@@ -56,13 +69,19 @@ async def root():
     }
 
 
+# --- Domains ---
+
 @app.get("/domains")
 async def list_domains():
-    """List available domain adapters."""
-    return {
-        name: {"description": adapter.description}
-        for name, adapter in DomainRegistry.all().items()
-    }
+    """List all 13 domain adapters with signal speed tiers."""
+    result = {}
+    for name, adapter in DomainRegistry.all().items():
+        speed = DOMAIN_SIGNAL_SPEED.get(name)
+        result[name] = {
+            "description": adapter.description,
+            "signal_speed": speed.value if speed else "medium",
+        }
+    return result
 
 
 @app.post("/domains/{domain}/template")
@@ -74,15 +93,16 @@ async def get_domain_template(domain: str):
     return {"domain": domain, "template": adapter.get_strategy_template()}
 
 
+# --- Single Loops ---
+
 @app.post("/loops")
 async def start_loop(req: RunRequest):
-    """Start an autonomous research loop."""
+    """Start a single autonomous research loop."""
     loop_id = str(uuid.uuid4())[:8]
 
     if not req.strategy_content and not req.strategy_path:
         raise HTTPException(400, "Provide strategy_content or strategy_path")
 
-    # Parse strategy
     if req.strategy_content:
         strategy = StrategyLoader.parse(req.strategy_content)
     else:
@@ -112,12 +132,10 @@ async def start_loop(req: RunRequest):
     _loops[loop_id] = {
         "id": loop_id,
         "strategy": strategy.name,
-        "status": "running",
         "loop": loop,
         "events": events,
     }
 
-    # Run in background
     asyncio.get_event_loop().run_in_executor(None, loop.run)
 
     return {
@@ -175,6 +193,98 @@ async def get_best_artifact(loop_id: str):
         "best_artifact": state.best_artifact,
         "best_metrics": state.metrics.summary(),
     }
+
+
+# --- Campaigns (multi-loop) ---
+
+@app.post("/campaigns")
+async def start_campaign(req: CampaignRequest):
+    """Start a multi-loop campaign across growth surfaces."""
+    campaign_id = str(uuid.uuid4())[:8]
+
+    default_models = {"anthropic": "claude-sonnet-4-20250514", "openai": "gpt-4o"}
+    config = CampaignConfig(
+        name=req.name,
+        strategies_dir=req.strategies_dir,
+        results_dir=req.results_dir,
+        agent_config=AgentConfig(
+            provider=req.provider,
+            model=req.model or default_models.get(req.provider, "claude-sonnet-4-20250514"),
+        ),
+        max_workers=req.max_workers,
+        dry_run=req.dry_run,
+    )
+
+    orchestrator = Orchestrator(config)
+    events: list[dict] = []
+    orchestrator.on_event(lambda etype, data: events.append({"type": etype, **data}))
+
+    keys = orchestrator.add_strategies_from_dir()
+    if not keys:
+        raise HTTPException(400, f"No strategy files found in {req.strategies_dir}")
+
+    _campaigns[campaign_id] = {
+        "id": campaign_id,
+        "name": req.name,
+        "orchestrator": orchestrator,
+        "events": events,
+        "strategies": keys,
+    }
+
+    asyncio.get_event_loop().run_in_executor(None, orchestrator.run)
+
+    return {
+        "campaign_id": campaign_id,
+        "name": req.name,
+        "status": "running",
+        "loops": len(keys),
+        "strategies": keys,
+    }
+
+
+@app.get("/campaigns")
+async def list_campaigns():
+    """List all campaigns."""
+    return [
+        {
+            "id": info["id"],
+            "name": info["name"],
+            "loops": len(info["strategies"]),
+            "status": info["orchestrator"].status(),
+        }
+        for info in _campaigns.values()
+    ]
+
+
+@app.get("/campaigns/{campaign_id}")
+async def get_campaign(campaign_id: str):
+    """Get campaign status with all loop details."""
+    info = _campaigns.get(campaign_id)
+    if not info:
+        raise HTTPException(404, f"Campaign not found: {campaign_id}")
+
+    return {
+        "id": campaign_id,
+        **info["orchestrator"].status(),
+        "insights": [
+            {
+                "source": i.source_domain,
+                "type": i.insight_type,
+                "insight": i.insight[:200],
+                "targets": i.target_domains,
+            }
+            for i in info["orchestrator"].insights
+        ],
+        "recent_events": info["events"][-30:],
+    }
+
+
+# --- Utils ---
+
+@app.get("/math")
+async def get_math():
+    """The experiment math: you vs your competitor."""
+    return estimate_experiments()
 
 
 @app.post("/validate")
