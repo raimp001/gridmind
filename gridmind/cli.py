@@ -68,11 +68,40 @@ def _make_event_handler(verbose: bool):
                 f"  [bold red]ERROR[/] (iter {data['iteration']}): {data['error']}"
             )
 
+        elif event_type == "checkpoint_resumed":
+            console.print(
+                Panel(
+                    f"[cyan]Resumed from checkpoint at iteration {data['iteration']}[/]\n"
+                    f"Experiments restored: {data['experiments_restored']}",
+                    border_style="cyan",
+                )
+            )
+
+        elif event_type == "loop_converged":
+            console.print(
+                Panel(
+                    f"[yellow]Converged at iteration {data['iteration']}[/]\n"
+                    f"No improvement since iteration {data['last_improvement']}\n"
+                    f"Window: {data['window']} iterations",
+                    border_style="yellow",
+                )
+            )
+
         elif event_type == "loop_paused":
             console.print(
                 Panel(
                     f"[yellow]Paused at iteration {data['iteration']}. Progress saved.[/]",
                     border_style="yellow",
+                )
+            )
+
+        elif event_type == "loop_paused_failures":
+            console.print(
+                Panel(
+                    f"[red]Paused at iteration {data['iteration']} after "
+                    f"{data['consecutive_failures']} consecutive failures.[/]\n"
+                    "Check logs, fix the issue, then resume with --resume.",
+                    border_style="red",
                 )
             )
 
@@ -180,14 +209,32 @@ def main():
 @click.option("--dry-run", is_flag=True, help="Run with mock data (no LLM calls)")
 @click.option("--verbose", "-v", is_flag=True, help="Show all experiment details")
 @click.option("--iterations", "-n", default=None, type=int, help="Override max iterations")
-def run(strategy_path, results_dir, provider, model, dry_run, verbose, iterations):
+@click.option("--resume", is_flag=True, help="Resume from last checkpoint")
+@click.option(
+    "--convergence-window", default=0, type=int,
+    help="Stop if no improvement in N iterations (0 = disabled)",
+)
+@click.option(
+    "--daemon", is_flag=True,
+    help="Run as daemon with graceful shutdown, watchdog, and heartbeat",
+)
+@click.option(
+    "--repeat", default=0, type=int,
+    help="(Daemon) Repeat loop every N seconds (0 = run once)",
+)
+def run(
+    strategy_path, results_dir, provider, model, dry_run, verbose,
+    iterations, resume, convergence_window, daemon, repeat,
+):
     """Run an autonomous research loop from a strategy document.
 
     STRATEGY_PATH is the path to your .md strategy file.
 
     Example:
         gridmind run strategies/cold-email.md --dry-run -v
-        gridmind run strategies/ad-creative.md --provider anthropic -n 50
+        gridmind run strategies/cold-email.md --resume
+        gridmind run strategies/cold-email.md --daemon --repeat 3600
+        gridmind run strategies/ad-creative.md --convergence-window 20
     """
     default_models = {
         "anthropic": "claude-sonnet-4-20250514",
@@ -205,6 +252,7 @@ def run(strategy_path, results_dir, provider, model, dry_run, verbose, iteration
         agent_config=agent_config,
         dry_run=dry_run,
         verbose=verbose,
+        convergence_window=convergence_window,
     )
 
     loop = ResearchLoop(config)
@@ -215,6 +263,7 @@ def run(strategy_path, results_dir, provider, model, dry_run, verbose, iteration
     if iterations:
         strategy.max_iterations = iterations
 
+    mode = "daemon" if daemon else ("resume" if resume else "fresh")
     console.print(
         Panel(
             f"[bold]{strategy.name}[/]\n"
@@ -222,17 +271,39 @@ def run(strategy_path, results_dir, provider, model, dry_run, verbose, iteration
             f"Objective: {strategy.objective}\n"
             f"Iterations: {strategy.max_iterations}\n"
             f"Provider: {provider} / {agent_config.model}\n"
-            f"Dry run: {dry_run}",
+            f"Dry run: {dry_run}\n"
+            f"Mode: {mode}"
+            + (f"\nConvergence window: {convergence_window}" if convergence_window else "")
+            + (f"\nRepeat every: {repeat}s" if repeat else ""),
             title="GridMind Research Loop",
             border_style="blue",
         )
     )
 
-    state = loop.run()
+    if daemon:
+        from gridmind.core.daemon import DaemonConfig, LoopDaemon
 
-    console.print(f"\n[bold]Results saved to:[/] {results_dir}/{strategy.name}/")
-    if state.best_artifact:
-        console.print(f"[bold]Best artifact:[/] {results_dir}/{strategy.name}/best_artifact.txt")
+        daemon_config = DaemonConfig(
+            loop_config=config,
+            heartbeat_path=f"{results_dir}/{strategy.name}/heartbeat.json",
+            repeat_interval=repeat,
+            pid_file=f"{results_dir}/{strategy.name}/gridmind.pid",
+        )
+        daemon_runner = LoopDaemon(daemon_config)
+        console.print("[bold yellow]Running in daemon mode. SIGTERM to stop gracefully.[/]")
+        state = daemon_runner.run()
+    else:
+        state = loop.run()
+
+    if state:
+        console.print(f"\n[bold]Results saved to:[/] {results_dir}/{strategy.name}/")
+        if state.best_artifact:
+            console.print(f"[bold]Best artifact:[/] {results_dir}/{strategy.name}/best_artifact.txt")
+        if state.status == "converged":
+            console.print(
+                f"[bold yellow]Converged:[/] No improvement since iteration "
+                f"{state.last_improvement_iteration} (window: {convergence_window})"
+            )
 
 
 @main.command()

@@ -1,9 +1,14 @@
-"""FastAPI server for running research loops and campaigns via API."""
+"""FastAPI server for running research loops and campaigns via API.
+
+Includes webhook endpoint for ingesting real-world metrics from production.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -23,12 +28,13 @@ from gridmind.domains.registry import DomainRegistry
 app = FastAPI(
     title="GridMind",
     description="Autonomous research loops for any domain. Write strategy docs, run experiments while you sleep.",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # In-memory store
 _loops: dict[str, dict] = {}
 _campaigns: dict[str, dict] = {}
+_webhook_events: list[dict] = []  # Real-world metrics from production
 
 
 class RunRequest(BaseModel):
@@ -51,13 +57,23 @@ class CampaignRequest(BaseModel):
     results_dir: str = "results"
 
 
+class WebhookEvent(BaseModel):
+    """Real-world metric data from production systems (SendGrid, GA, etc.)."""
+    source: str  # e.g. "sendgrid", "google_analytics", "mixpanel"
+    loop_id: str | None = None  # link to a specific loop
+    experiment_iteration: int | None = None  # link to specific experiment
+    metrics: dict[str, float]  # e.g. {"reply_rate": 0.05, "open_rate": 0.42}
+    metadata: dict | None = None  # arbitrary context
+    timestamp: str | None = None
+
+
 # --- Root ---
 
 @app.get("/")
 async def root():
     return {
         "name": "GridMind",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "description": "Autonomous research loops for any domain",
         "domains": len(DomainRegistry.list_domains()),
         "pattern": [
@@ -306,3 +322,79 @@ async def validate_strategy(req: RunRequest):
         }
     except Exception as e:
         return {"valid": False, "error": str(e)}
+
+
+# --- Webhooks: Real-world metric ingestion ---
+
+@app.post("/webhooks/metrics")
+async def receive_metrics(event: WebhookEvent):
+    """Receive real-world metrics from production systems.
+
+    POST metrics from SendGrid, Google Analytics, Mixpanel, etc.
+    These feed back into the loop to ground-truth LLM evaluations.
+
+    Example payload:
+        {
+            "source": "sendgrid",
+            "loop_id": "abc12345",
+            "experiment_iteration": 42,
+            "metrics": {"reply_rate": 0.05, "open_rate": 0.42},
+            "metadata": {"campaign_id": "q1-outbound"}
+        }
+    """
+    record = {
+        "source": event.source,
+        "loop_id": event.loop_id,
+        "experiment_iteration": event.experiment_iteration,
+        "metrics": event.metrics,
+        "metadata": event.metadata,
+        "timestamp": event.timestamp or datetime.now(timezone.utc).isoformat(),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _webhook_events.append(record)
+
+    # If linked to a running loop, update its metrics
+    if event.loop_id and event.loop_id in _loops:
+        loop_info = _loops[event.loop_id]
+        loop_state = loop_info["loop"].state
+        for metric_name, value in event.metrics.items():
+            loop_state.metrics.record(
+                metric_name, value,
+                iteration=event.experiment_iteration or loop_state.current_iteration,
+                direction="higher",
+            )
+        loop_info["events"].append({"type": "webhook_metrics", **record})
+
+    # Persist to disk
+    _persist_webhook_events()
+
+    return {
+        "status": "received",
+        "total_events": len(_webhook_events),
+        "linked_to_loop": event.loop_id if event.loop_id in _loops else None,
+    }
+
+
+@app.get("/webhooks/metrics")
+async def list_webhook_events(
+    source: str | None = None,
+    loop_id: str | None = None,
+    limit: int = 100,
+):
+    """List received webhook metric events, optionally filtered."""
+    events = _webhook_events
+    if source:
+        events = [e for e in events if e["source"] == source]
+    if loop_id:
+        events = [e for e in events if e.get("loop_id") == loop_id]
+    return {"total": len(events), "events": events[-limit:]}
+
+
+def _persist_webhook_events():
+    """Save webhook events to disk for durability."""
+    try:
+        path = Path("results") / "webhook_events.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_webhook_events, indent=2))
+    except OSError:
+        pass
