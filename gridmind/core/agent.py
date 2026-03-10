@@ -50,6 +50,7 @@ def _build_experiment_prompt(
     iteration: int,
     past_results: list[dict],
     best_metrics: dict[str, dict],
+    bandit_suggestion: dict[str, str] | None = None,
 ) -> str:
     parts = [
         f"# Strategy: {strategy.name}",
@@ -86,6 +87,16 @@ def _build_experiment_prompt(
                 f"- Iter {r['iteration']} [{status}]: {metrics_str} | "
                 f"vars={json.dumps(r.get('variables', {}))}"
             )
+
+    # Bandit-recommended variables (from Thompson Sampling)
+    if bandit_suggestion:
+        parts.append("\n## Recommended variables (from optimization algorithm)")
+        parts.append(
+            "The following variable values are statistically likely to perform well "
+            "based on past results. You may use them or deviate if you have a strong hypothesis."
+        )
+        for var, val in bandit_suggestion.items():
+            parts.append(f"- **{var}**: {val}")
 
     parts.append(f"\n## Experiment Instructions\n\n{strategy.experiment_template}")
     parts.append(
@@ -346,12 +357,15 @@ class ResearchAgent:
         iteration: int,
         past_results: list[dict],
         best_metrics: dict[str, dict],
+        bandit_suggestion: dict[str, str] | None = None,
     ) -> dict:
         """Ask the LLM to design the next experiment.
 
         Returns validated design dict with retries and JSON repair.
         """
-        prompt = _build_experiment_prompt(strategy, iteration, past_results, best_metrics)
+        prompt = _build_experiment_prompt(
+            strategy, iteration, past_results, best_metrics, bandit_suggestion,
+        )
         temp = self._get_temperature(iteration, strategy.max_iterations)
 
         text = self._call_llm(SYSTEM_PROMPT, prompt, temp, self.config.max_tokens)

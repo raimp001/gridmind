@@ -9,6 +9,8 @@ Production features:
 - Checkpoint save/load for crash recovery
 - Convergence detection (early stopping)
 - Graceful error handling with fallback to mock
+- Multi-armed bandit for variable selection
+- Statistical significance testing
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gridmind.core.agent import AgentConfig, ResearchAgent
+from gridmind.core.bandit import ExperimentBandit
 from gridmind.core.experiment import Experiment, ExperimentResult, ExperimentStatus
 from gridmind.core.metrics import MetricTracker, MetricSnapshot
+from gridmind.core.stats import welch_t_test, confidence_interval, metric_is_improving
 from gridmind.core.strategy import Strategy, StrategyLoader
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,9 @@ class LoopConfig:
     max_consecutive_failures: int = 10
     # Fallback to mock on LLM failure (keeps loop alive)
     fallback_on_error: bool = True
+    # Multi-armed bandit for variable selection
+    use_bandit: bool = True
+    bandit_method: str = "thompson"  # "thompson", "ucb1", "epsilon_greedy"
 
 
 @dataclass
@@ -72,6 +79,7 @@ class ResearchLoop:
         self.state = LoopState()
         self.agent = ResearchAgent(config.agent_config)
         self._callbacks: list = []
+        self._bandit: ExperimentBandit | None = None
 
     def on_event(self, callback):
         """Register a callback for loop events: (event_type, data)."""
@@ -165,10 +173,29 @@ class ResearchLoop:
 
         start_iteration = self.state.current_iteration + 1
 
+        # Initialize bandit for variable selection
+        if self.config.use_bandit and strategy.variables:
+            self._bandit = ExperimentBandit(
+                strategy.variables, method=self.config.bandit_method,
+            )
+            # Restore bandit from checkpoint if available
+            if resumed:
+                bandit_path = results_dir / "bandit_state.json"
+                if bandit_path.exists():
+                    try:
+                        bandit_data = json.loads(bandit_path.read_text())
+                        self._bandit = ExperimentBandit.from_dict(
+                            bandit_data, strategy.variables,
+                        )
+                        logger.info("Restored bandit state from checkpoint")
+                    except Exception as e:
+                        logger.warning("Could not restore bandit state: %s", e)
+
         self._emit("loop_started", {
             "name": strategy.name,
             "max_iterations": strategy.max_iterations,
             "resumed_from": start_iteration - 1 if resumed else 0,
+            "bandit_enabled": self._bandit is not None,
         })
 
         # Set baselines (only if not resumed)
@@ -263,15 +290,21 @@ class ResearchLoop:
         """Run a single iteration of the loop."""
         self._emit("iteration_started", {"iteration": iteration})
 
+        # 0. Get bandit suggestions for variable selection
+        bandit_hint = None
+        if self._bandit:
+            bandit_hint = self._bandit.select_variables()
+
         # 1. Agent designs the experiment
         if self.config.dry_run:
-            design = _mock_design(strategy, iteration)
+            design = _mock_design(strategy, iteration, bandit_hint)
         else:
             design = self.agent.design_experiment(
                 strategy=strategy,
                 iteration=iteration,
                 past_results=self.state.past_results(),
                 best_metrics=self.state.metrics.summary(),
+                bandit_suggestion=bandit_hint,
             )
 
         experiment = Experiment(
@@ -322,6 +355,15 @@ class ResearchLoop:
                 "metrics": scores,
             })
 
+        # 4. Update bandit with reward signal
+        if self._bandit and experiment.variables:
+            primary = strategy.primary_metric
+            if primary and primary.name in scores:
+                reward = scores[primary.name]
+                # Normalize reward to [0, 1] if needed
+                reward = max(0.0, min(1.0, reward))
+                self._bandit.update(experiment.variables, reward)
+
         self._emit("iteration_completed", {
             "iteration": iteration,
             "status": experiment.status.value,
@@ -365,6 +407,11 @@ class ResearchLoop:
             tmp_path = results_dir / "checkpoint.json.tmp"
             tmp_path.write_text(json.dumps(checkpoint, indent=2))
             tmp_path.rename(results_dir / "checkpoint.json")
+
+            # Also save bandit state
+            if self._bandit:
+                bandit_path = results_dir / "bandit_state.json"
+                bandit_path.write_text(json.dumps(self._bandit.to_dict(), indent=2))
         except OSError as e:
             logger.error("Failed to save checkpoint: %s", e)
 
@@ -411,14 +458,82 @@ class ResearchLoop:
             json.dumps(history, indent=2)
         )
 
+        # Statistical significance report
+        if self.state.strategy:
+            self._save_significance_report(results_dir, self.state.strategy)
 
-def _mock_design(strategy: Strategy, iteration: int) -> dict:
+        # Bandit stats
+        if self._bandit:
+            (results_dir / "bandit_stats.json").write_text(
+                json.dumps({
+                    "method": self._bandit.method,
+                    "total_experiments": self._bandit.total_experiments,
+                    "exploration_coverage": round(self._bandit.exploration_coverage, 4),
+                    "top_values": self._bandit.top_values(),
+                    "all_stats": self._bandit.stats(),
+                }, indent=2)
+            )
+
+    def _save_significance_report(self, results_dir: Path, strategy: Strategy):
+        """Run significance tests and save the report."""
+        if len(self.state.experiments) < 10:
+            return  # Not enough data
+
+        report = {}
+        for m in strategy.metrics:
+            values = [
+                s.value for s in self.state.metrics.history
+                if s.name == m.name
+            ]
+            if len(values) < 4:
+                continue
+
+            # Split into early and late halves
+            mid = len(values) // 2
+            early = values[:mid]
+            late = values[mid:]
+
+            test = welch_t_test(early, late)
+            ci = confidence_interval(values)
+
+            report[m.name] = {
+                "early_mean": round(test.mean_a, 4),
+                "late_mean": round(test.mean_b, 4),
+                "improvement": round(test.improvement, 4),
+                "is_significant": test.is_significant,
+                "p_value": round(test.p_value, 4),
+                "effect_size": round(test.effect_size, 2),
+                "effect_label": test.effect_label,
+                "confidence_interval_95": [round(ci[0], 4), round(ci[2], 4)],
+                "overall_mean": round(ci[1], 4),
+                "summary": test.summary(),
+            }
+
+            # Also test if metric is trending upward
+            trend = metric_is_improving(values, window=min(10, len(values) // 3))
+            if trend:
+                report[m.name]["trend"] = {
+                    "improving": trend.improvement > 0 and trend.is_significant,
+                    "trend_summary": trend.summary(),
+                }
+
+        if report:
+            (results_dir / "significance_report.json").write_text(
+                json.dumps(report, indent=2)
+            )
+
+
+def _mock_design(strategy: Strategy, iteration: int, bandit_hint: dict | None = None) -> dict:
     """Mock experiment design for dry runs / testing."""
     import random
 
     variables = {}
     for var, options in strategy.variables.items():
-        variables[var] = random.choice(options)
+        # Use bandit suggestion if available, otherwise random
+        if bandit_hint and var in bandit_hint:
+            variables[var] = bandit_hint[var]
+        else:
+            variables[var] = random.choice(options)
 
     return {
         "hypothesis": f"[DRY RUN] Iteration {iteration} exploring {variables}",

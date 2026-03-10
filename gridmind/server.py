@@ -22,6 +22,7 @@ from gridmind.core.orchestrator import (
     DOMAIN_SIGNAL_SPEED,
     estimate_experiments,
 )
+from gridmind.core.store import StateStore
 from gridmind.core.strategy import StrategyLoader
 from gridmind.domains.registry import DomainRegistry
 
@@ -31,10 +32,11 @@ app = FastAPI(
     version="0.3.0",
 )
 
-# In-memory store
+# In-memory store (hot cache) + SQLite (durable)
 _loops: dict[str, dict] = {}
 _campaigns: dict[str, dict] = {}
-_webhook_events: list[dict] = []  # Real-world metrics from production
+_webhook_events: list[dict] = []
+_store = StateStore("results/gridmind.db")
 
 
 class RunRequest(BaseModel):
@@ -152,6 +154,9 @@ async def start_loop(req: RunRequest):
         "events": events,
     }
 
+    # Persist to SQLite
+    _store.save_loop(loop_id, strategy.name, status="running")
+
     asyncio.get_event_loop().run_in_executor(None, loop.run)
 
     return {
@@ -194,6 +199,12 @@ async def get_loop(loop_id: str):
         "best_metrics": state.metrics.summary(),
         "recent_events": info["events"][-20:],
     }
+
+
+@app.get("/loops/history")
+async def loops_history():
+    """List all loops from persistent storage (survives server restart)."""
+    return _store.list_loops()
 
 
 @app.get("/loops/{loop_id}/best")
@@ -365,7 +376,15 @@ async def receive_metrics(event: WebhookEvent):
             )
         loop_info["events"].append({"type": "webhook_metrics", **record})
 
-    # Persist to disk
+    # Persist to SQLite + disk
+    _store.save_webhook_event(
+        source=event.source,
+        metrics=event.metrics,
+        loop_id=event.loop_id,
+        experiment_iteration=event.experiment_iteration,
+        metadata=event.metadata,
+        timestamp=event.timestamp,
+    )
     _persist_webhook_events()
 
     return {
